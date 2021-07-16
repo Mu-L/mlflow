@@ -17,6 +17,7 @@ import yaml
 import mlflow.pyfunc as pyfunc
 import mlflow.pytorch
 import mlflow.pyfunc.scoring_server as pyfunc_scoring_server
+from mlflow.pytorch import get_default_conda_env
 from mlflow import tracking
 from mlflow.exceptions import MlflowException
 from mlflow.models import Model, infer_signature
@@ -24,11 +25,12 @@ from mlflow.models.utils import _read_example
 from mlflow.pytorch import pickle_module as mlflow_pytorch_pickle_module
 from mlflow.store.artifact.s3_artifact_repo import S3ArtifactRepository
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
-from mlflow.utils.environment import _mlflow_conda_env
+from mlflow.utils.environment import _mlflow_conda_env, _mlflow_additional_pip_env
 from mlflow.utils.file_utils import TempDir
 from mlflow.utils.model_utils import _get_flavor_configuration
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 
+from tests.helper_functions import _compare_conda_env_requirements
 
 _logger = logging.getLogger(__name__)
 
@@ -84,9 +86,13 @@ def train_model(model, data):
             optimizer.step()
 
 
+def get_sequential_model():
+    return nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 1))
+
+
 @pytest.fixture
 def sequential_model(data, scripted_model):
-    model = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 1),)
+    model = get_sequential_model()
     if scripted_model:
         model = torch.jit.script(model)
 
@@ -154,11 +160,7 @@ def model_path(tmpdir):
 @pytest.fixture
 def pytorch_custom_env(tmpdir):
     conda_env = os.path.join(str(tmpdir), "conda_env.yml")
-    _mlflow_conda_env(
-        conda_env,
-        additional_conda_deps=["pytorch", "torchvision", "pytest"],
-        additional_conda_channels=["pytorch"],
-    )
+    _mlflow_conda_env(conda_env, additional_pip_deps=["pytorch", "torchvision", "pytest"])
     return conda_env
 
 
@@ -312,6 +314,37 @@ def test_save_and_load_model(sequential_model, model_path, data, sequential_pred
 
 @pytest.mark.large
 @pytest.mark.parametrize("scripted_model", [True, False])
+def test_pyfunc_model_works_with_np_input_type(
+    sequential_model, model_path, data, sequential_predicted
+):
+    mlflow.pytorch.save_model(sequential_model, model_path)
+
+    # Loading pyfunc model
+    pyfunc_loaded = mlflow.pyfunc.load_pyfunc(model_path)
+
+    # predict works with dataframes
+    df_result = pyfunc_loaded.predict(data[0])
+    assert type(df_result) == pd.DataFrame
+    np.testing.assert_array_almost_equal(df_result.values[:, 0], sequential_predicted, decimal=4)
+
+    # predict works with numpy ndarray
+    np_result = pyfunc_loaded.predict(data[0].values.astype(np.float32))
+    assert type(np_result) == np.ndarray
+    np.testing.assert_array_almost_equal(np_result[:, 0], sequential_predicted, decimal=4)
+
+    # predict does not work with lists
+    with pytest.raises(TypeError) as exc_info:
+        pyfunc_loaded.predict([1, 2, 3, 4])
+    assert "The PyTorch flavor does not support List or Dict input types" in str(exc_info)
+
+    # predict does not work with scalars
+    with pytest.raises(TypeError) as exc_info:
+        pyfunc_loaded.predict(4)
+    assert "Input data should be pandas.DataFrame or numpy.ndarray" in str(exc_info)
+
+
+@pytest.mark.large
+@pytest.mark.parametrize("scripted_model", [True, False])
 def test_load_model_from_remote_uri_succeeds(
     sequential_model, model_path, mock_s3_bucket, data, sequential_predicted
 ):
@@ -346,6 +379,19 @@ def test_model_save_persists_specified_conda_env_in_mlflow_model_directory(
     with open(saved_conda_env_path, "r") as f:
         saved_conda_env_text = f.read()
     assert saved_conda_env_text == pytorch_custom_env_text
+
+
+@pytest.mark.large
+@pytest.mark.parametrize("scripted_model", [True, False])
+def test_model_save_persists_requirements_in_mlflow_model_directory(
+    sequential_model, model_path, pytorch_custom_env
+):
+    mlflow.pytorch.save_model(
+        pytorch_model=sequential_model, path=model_path, conda_env=pytorch_custom_env
+    )
+
+    saved_pip_req_path = os.path.join(model_path, "requirements.txt")
+    _compare_conda_env_requirements(pytorch_custom_env, saved_pip_req_path)
 
 
 @pytest.mark.large
@@ -392,6 +438,28 @@ def test_model_log_persists_specified_conda_env_in_mlflow_model_directory(
     with open(saved_conda_env_path, "r") as f:
         saved_conda_env_text = f.read()
     assert saved_conda_env_text == pytorch_custom_env_text
+
+
+@pytest.mark.large
+@pytest.mark.parametrize("scripted_model", [True, False])
+def test_model_log_persists_requirements_in_mlflow_model_directory(
+    sequential_model, pytorch_custom_env
+):
+    artifact_path = "model"
+    with mlflow.start_run():
+        mlflow.pytorch.log_model(
+            pytorch_model=sequential_model,
+            artifact_path=artifact_path,
+            conda_env=pytorch_custom_env,
+        )
+        model_path = _download_artifact_from_uri(
+            "runs:/{run_id}/{artifact_path}".format(
+                run_id=mlflow.active_run().info.run_id, artifact_path=artifact_path
+            )
+        )
+
+    saved_pip_req_path = os.path.join(model_path, "requirements.txt")
+    _compare_conda_env_requirements(pytorch_custom_env, saved_pip_req_path)
 
 
 @pytest.mark.large
@@ -749,37 +817,12 @@ def test_load_model_allows_user_to_override_pickle_module_via_keyword_argument(
         pickle_module=pickle,
     )
 
-    mlflow_torch_pickle_load = mlflow_pytorch_pickle_module.Unpickler
-
-    pickle_call_results = {
-        "mlflow_torch_pickle_load_called": False,
-    }
-
-    def validate_mlflow_torch_pickle_load_called(*args, **kwargs):
-        pickle_call_results["mlflow_torch_pickle_load_called"] = True
-        return mlflow_torch_pickle_load(*args, **kwargs)
-
-    log_messages = []
-
-    def custom_warn(message_text, *args, **kwargs):
-        log_messages.append(message_text % args % kwargs)
-
-    with mock.patch(
-        "mlflow.pytorch.pickle_module.Unpickler"
-    ) as mlflow_torch_pickle_load_mock, mock.patch("mlflow.pytorch._logger.warning") as warn_mock:
-        mlflow_torch_pickle_load_mock.side_effect = validate_mlflow_torch_pickle_load_called
-        warn_mock.side_effect = custom_warn
+    with mock.patch("torch.load") as torch_load_mock, mock.patch(
+        "mlflow.pytorch._logger.warning"
+    ) as warn_mock:
         mlflow.pytorch.load_model(model_uri=model_path, pickle_module=mlflow_pytorch_pickle_module)
-
-    assert all(pickle_call_results.values())
-    assert any(
-        [
-            "does not match the pickle module that was used to save the model" in log_message
-            and pickle.__name__ in log_message
-            and mlflow_pytorch_pickle_module.__name__ in log_message
-            for log_message in log_messages
-        ]
-    )
+        torch_load_mock.assert_called_with(mock.ANY, pickle_module=mlflow_pytorch_pickle_module)
+        warn_mock.assert_any_call(mock.ANY, mlflow_pytorch_pickle_module.__name__, pickle.__name__)
 
 
 @pytest.mark.large
@@ -853,6 +896,11 @@ def test_requirements_file_log_model(create_requirements_file, sequential_model)
             run_id=mlflow.active_run().info.run_id, model_path="models"
         )
 
+        # Verify that explicitly specified requirements file overrides default requirements file
+        conda_env = get_default_conda_env()
+        pip_deps = conda_env["dependencies"][-1]["pip"]
+        assert _mlflow_additional_pip_env(pip_deps) != content_expected
+
         with TempDir(remove_on_exit=True) as tmp:
             model_path = _download_artifact_from_uri(model_uri, tmp.path())
             model_config_path = os.path.join(model_path, "MLmodel")
@@ -876,8 +924,14 @@ def test_requirements_file_save_model(create_requirements_file, sequential_model
     with TempDir(remove_on_exit=True) as tmp:
         model_path = os.path.join(tmp.path(), "models")
         mlflow.pytorch.save_model(
-            pytorch_model=sequential_model, path=model_path, requirements_file=requirements_file,
+            pytorch_model=sequential_model, path=model_path, requirements_file=requirements_file
         )
+
+        # Verify that explicitly specified requirements file overrides default requirements file
+        conda_env = get_default_conda_env()
+        pip_deps = conda_env["dependencies"][-1]["pip"]
+        assert _mlflow_additional_pip_env(pip_deps) != content_expected
+
         model_config_path = os.path.join(model_path, "MLmodel")
         model_config = Model.load(model_config_path)
         flavor_config = model_config.flavors["pytorch"]
@@ -1001,3 +1055,86 @@ def test_log_model_invalid_extra_file_type(sequential_model):
             conda_env=None,
             extra_files="inexistent_file.txt",
         )
+
+
+def state_dict_equal(state_dict1, state_dict2):
+    for key1 in state_dict1:
+        if key1 not in state_dict2:
+            return False
+
+        value1 = state_dict1[key1]
+        value2 = state_dict2[key1]
+
+        if type(value1) != type(value2):
+            return False
+        elif isinstance(value1, dict):
+            if not state_dict_equal(value1, value2):
+                return False
+        elif isinstance(value1, torch.Tensor):
+            if not torch.equal(value1, value2):
+                return False
+        elif value1 != value2:
+            return False
+        else:
+            continue
+
+    return True
+
+
+@pytest.mark.large
+@pytest.mark.parametrize("scripted_model", [True, False])
+def test_save_state_dict(sequential_model, model_path, data):
+    state_dict = sequential_model.state_dict()
+    mlflow.pytorch.save_state_dict(state_dict, model_path)
+
+    loaded_state_dict = mlflow.pytorch.load_state_dict(model_path)
+    assert state_dict_equal(loaded_state_dict, state_dict)
+    model = get_sequential_model()
+    model.load_state_dict(loaded_state_dict)
+    np.testing.assert_array_almost_equal(
+        _predict(model, data), _predict(sequential_model, data), decimal=4,
+    )
+
+
+@pytest.mark.large
+def test_save_state_dict_can_save_nested_state_dict(model_path):
+    """
+    This test ensures that `save_state_dict` supports a use case described in the page below
+    where a user bundles multiple objects (e.g., model, optimizer, learning-rate scheduler)
+    into a single nested state_dict and loads it back later for inference or re-training:
+    https://pytorch.org/tutorials/recipes/recipes/saving_and_loading_a_general_checkpoint.html
+    """
+    model = get_sequential_model()
+    optim = torch.optim.Adam(model.parameters())
+    state_dict = {"model": model.state_dict(), "optim": optim.state_dict()}
+    mlflow.pytorch.save_state_dict(state_dict, model_path)
+
+    loaded_state_dict = mlflow.pytorch.load_state_dict(model_path)
+    assert state_dict_equal(loaded_state_dict, state_dict)
+    model.load_state_dict(loaded_state_dict["model"])
+    optim.load_state_dict(loaded_state_dict["optim"])
+
+
+@pytest.mark.large
+@pytest.mark.parametrize("not_state_dict", [0, "", get_sequential_model()])
+def test_save_state_dict_throws_for_invalid_object_type(not_state_dict, model_path):
+    with pytest.raises(TypeError, match="Invalid object type for `state_dict`"):
+        mlflow.pytorch.save_state_dict(not_state_dict, model_path)
+
+
+@pytest.mark.large
+@pytest.mark.parametrize("scripted_model", [True, False])
+def test_log_state_dict(sequential_model, data):
+    artifact_path = "model"
+    state_dict = sequential_model.state_dict()
+    with mlflow.start_run():
+        mlflow.pytorch.log_state_dict(state_dict, artifact_path)
+        state_dict_uri = mlflow.get_artifact_uri(artifact_path)
+
+    loaded_state_dict = mlflow.pytorch.load_state_dict(state_dict_uri)
+    assert state_dict_equal(loaded_state_dict, state_dict)
+    model = get_sequential_model()
+    model.load_state_dict(loaded_state_dict)
+    np.testing.assert_array_almost_equal(
+        _predict(model, data), _predict(sequential_model, data), decimal=4,
+    )

@@ -2,8 +2,10 @@ import React from 'react';
 import { Table, Input, Form, Icon, Popconfirm, Button } from 'antd';
 import PropTypes from 'prop-types';
 import { IconButton } from '../../components/IconButton';
+import _ from 'lodash';
 
 import './EditableFormTable.css';
+import { FormattedMessage } from 'react-intl';
 
 const EditableContext = React.createContext();
 
@@ -59,6 +61,7 @@ export class EditableTable extends React.Component {
     onSaveEdit: PropTypes.func.isRequired,
     onDelete: PropTypes.func.isRequired,
     form: PropTypes.object.isRequired,
+    intl: PropTypes.any,
   };
 
   constructor(props) {
@@ -66,6 +69,10 @@ export class EditableTable extends React.Component {
     this.state = { editingKey: '', isRequestPending: false };
     this.columns = this.initColumns();
   }
+
+  // set table width as sum of columns rather than hard coding a width
+  // see ML-11973
+  getTotalTableWidth = () => _.sumBy(this.columns, 'width');
 
   initColumns = () => [
     ...this.props.columns.map((col) =>
@@ -86,9 +93,14 @@ export class EditableTable extends React.Component {
         : col,
     ),
     {
-      title: 'Actions',
+      title: (
+        <FormattedMessage
+          defaultMessage='Actions'
+          description='Column title for actions column in editable form table in MLflow'
+        />
+      ),
       dataIndex: 'operation',
-      width: 100,
+      width: 200,
       render: (text, record) => {
         const { editingKey, isRequestPending } = this.state;
         const editing = this.isEditing(record);
@@ -98,10 +110,16 @@ export class EditableTable extends React.Component {
         return editing ? (
           <span>
             <Button type='link' onClick={() => this.save(record.key)} style={{ marginRight: 10 }}>
-              Save
+              <FormattedMessage
+                defaultMessage='Save'
+                description='Text for saving changes on rows in editable form table in MLflow'
+              />
             </Button>
             <Button type='link' onClick={() => this.cancel(record.key)}>
-              Cancel
+              <FormattedMessage
+                defaultMessage='Cancel'
+                description='Text for canceling changes on rows in editable form table in MLflow'
+              />
             </Button>
           </span>
         ) : (
@@ -113,9 +131,27 @@ export class EditableTable extends React.Component {
               style={{ marginRight: 10 }}
             />
             <Popconfirm
-              title='Are you sure you want to delete this tag？'
-              okText='Confirm'
-              cancelText='Cancel'
+              title={
+                <FormattedMessage
+                  defaultMessage='Are you sure you want to delete this tag？'
+                  description='Title text for confirmation pop-up to delete a tag from table
+                     in MLflow'
+                />
+              }
+              okText={
+                <FormattedMessage
+                  defaultMessage='Confirm'
+                  description='OK button text for confirmation pop-up to delete a tag from table
+                     in MLflow'
+                />
+              }
+              cancelText={
+                <FormattedMessage
+                  defaultMessage='Cancel'
+                  description='Cancel button text for confirmation pop-up to delete a tag from
+                     table in MLflow'
+                />
+              }
               onConfirm={() => this.delete(record.key)}
             >
               <IconButton icon={<i className='far fa-trash-alt' />} disabled={editingKey !== ''} />
@@ -176,8 +212,16 @@ export class EditableTable extends React.Component {
           columns={this.columns}
           size='middle'
           pagination={false}
-          locale={{ emptyText: 'No tags found.' }}
+          locale={{
+            emptyText: (
+              <FormattedMessage
+                defaultMessage='No tags found.'
+                description='Text for no tags found in editable form table in MLflow'
+              />
+            ),
+          }}
           scroll={{ y: 280 }}
+          style={{ width: this.getTotalTableWidth() }}
         />
       </EditableContext.Provider>
     );

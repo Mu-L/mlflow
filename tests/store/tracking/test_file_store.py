@@ -129,7 +129,7 @@ class TestFileStore(unittest.TestCase, AbstractStoreTest):
         file_store = FileStore(self.test_root)
         try:
             file_store._check_root_dir()
-        except Exception as e:  # pylint: disable=broad-except
+        except Exception as e:
             self.fail("test_valid_root raised exception '%s'" % e.message)
 
         # Test removing root
@@ -145,6 +145,22 @@ class TestFileStore(unittest.TestCase, AbstractStoreTest):
             self.assertTrue(exp_id in self.experiments)
             self.assertEqual(exp.name, self.exp_data[exp_id]["name"])
             self.assertEqual(exp.artifact_location, self.exp_data[exp_id]["artifact_location"])
+
+    def test_list_experiments_paginated(self):
+        fs = FileStore(self.test_root)
+        for _ in range(10):
+            fs.create_experiment(random_str(12))
+        exps1 = fs.list_experiments(max_results=4, page_token=None)
+        self.assertEqual(len(exps1), 4)
+        self.assertIsNotNone(exps1.token)
+        exps2 = fs.list_experiments(max_results=4, page_token=None)
+        self.assertEqual(len(exps2), 4)
+        self.assertIsNotNone(exps2.token)
+        self.assertNotEqual(exps1, exps2)
+        exps3 = fs.list_experiments(max_results=500, page_token=exps2.token)
+        self.assertLessEqual(len(exps3), 500)
+        if len(exps3) < 500:
+            self.assertIsNone(exps3.token)
 
     def _verify_experiment(self, fs, exp_id):
         exp = fs.get_experiment(exp_id)

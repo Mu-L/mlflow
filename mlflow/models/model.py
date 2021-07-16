@@ -9,14 +9,22 @@ from typing import Any, Dict, Optional
 
 import mlflow
 from mlflow.exceptions import MlflowException
-from mlflow.models.signature import ModelSignature
 from mlflow.utils.file_utils import TempDir
+from mlflow.utils.databricks_utils import get_databricks_runtime
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 
 _logger = logging.getLogger(__name__)
 
 
 MLMODEL_FILE_NAME = "MLmodel"
+_LOG_MODEL_METADATA_WARNING_TEMPLATE = (
+    "Logging model metadata to the tracking server has failed, possibly due older "
+    "server version. The model artifacts have been logged successfully under %s. "
+    "In addition to exporting model artifacts, MLflow clients 1.7.0 and above "
+    "attempt to record model metadata to the  tracking store. If logging to a "
+    "mlflow server via REST, consider  upgrading the server version to MLflow "
+    "1.7.0 or above."
+)
 
 
 class Model(object):
@@ -31,7 +39,7 @@ class Model(object):
         run_id=None,
         utc_time_created=None,
         flavors=None,
-        signature: ModelSignature = None,
+        signature=None,  # ModelSignature
         saved_input_example_info: Dict[str, Any] = None,
         **kwargs
     ):
@@ -39,6 +47,10 @@ class Model(object):
         if run_id:
             self.run_id = run_id
             self.artifact_path = artifact_path
+
+        databricks_runtime = get_databricks_runtime()
+        if databricks_runtime:
+            self.databricks_runtime = databricks_runtime
         self.utc_time_created = str(utc_time_created or datetime.utcnow())
         self.flavors = flavors if flavors is not None else {}
         self.signature = signature
@@ -62,7 +74,7 @@ class Model(object):
         return self
 
     @property
-    def signature(self) -> Optional[ModelSignature]:
+    def signature(self):  # -> Optional[ModelSignature]
         return self._signature
 
     @signature.setter
@@ -115,6 +127,9 @@ class Model(object):
     @classmethod
     def from_dict(cls, model_dict):
         """Load a model from its YAML representation."""
+
+        from .signature import ModelSignature
+
         if "signature" in model_dict and isinstance(model_dict["signature"], dict):
             model_dict = model_dict.copy()
             model_dict["signature"] = ModelSignature.from_dict(model_dict["signature"])
@@ -176,15 +191,7 @@ class Model(object):
             except MlflowException:
                 # We need to swallow all mlflow exceptions to maintain backwards compatibility with
                 # older tracking servers. Only print out a warning for now.
-                _logger.warning(
-                    "Logging model metadata to the tracking server has failed, possibly due older "
-                    "server version. The model artifacts have been logged successfully under %s. "
-                    "In addition to exporting model artifacts, MLflow clients 1.7.0 and above "
-                    "attempt to record model metadata to the  tracking store. If logging to a "
-                    "mlflow server via REST, consider  upgrading the server version to MLflow "
-                    "1.7.0 or above.",
-                    mlflow.get_artifact_uri(),
-                )
+                _logger.warning(_LOG_MODEL_METADATA_WARNING_TEMPLATE, mlflow.get_artifact_uri())
             if registered_model_name is not None:
                 run_id = mlflow.tracking.fluent.active_run().info.run_id
                 mlflow.register_model(

@@ -23,11 +23,12 @@ from mlflow.models.utils import ModelInputExample, _save_example
 from mlflow.protos.databricks_pb2 import RESOURCE_ALREADY_EXISTS
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.utils.annotations import experimental
-from mlflow.utils.environment import _mlflow_conda_env
+from mlflow.utils.environment import _mlflow_conda_env, _log_pip_requirements
 from mlflow.utils.model_utils import _get_flavor_configuration
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 
 FLAVOR_NAME = "onnx"
+# TEMPORARY CHANGE to trigger cross version tests
 
 
 @experimental
@@ -40,7 +41,6 @@ def get_default_conda_env():
     import onnxruntime
 
     return _mlflow_conda_env(
-        additional_conda_deps=None,
         additional_pip_deps=[
             "onnx=={}".format(onnx.__version__),
             # The ONNX pyfunc representation requires the OnnxRuntime
@@ -48,7 +48,6 @@ def get_default_conda_env():
             # include OnnxRuntime
             "onnxruntime=={}".format(onnxruntime.__version__),
         ],
-        additional_conda_channels=None,
     )
 
 
@@ -101,9 +100,10 @@ def save_model(
                         signature = infer_signature(train, predictions)
     :param input_example: (Experimental) Input example provides one or several instances of valid
                           model input. The example can be used as a hint of what data to feed the
-                          model. The given example will be converted to a Pandas DataFrame and then
-                          serialized to json using the Pandas split-oriented format. Bytes are
-                          base64-encoded.
+                          model. The given example can be a Pandas DataFrame where the given
+                          example will be serialized to json using the Pandas split-oriented
+                          format, or a numpy array where the example will be serialized to json
+                          by converting it to a list. Bytes are base64-encoded.
 
     """
     import onnx
@@ -135,6 +135,8 @@ def save_model(
     with open(os.path.join(path, conda_env_subpath), "w") as f:
         yaml.safe_dump(conda_env, stream=f, default_flow_style=False)
 
+    _log_pip_requirements(conda_env, path)
+
     pyfunc.add_to_model(
         mlflow_model, loader_module="mlflow.onnx", data=model_data_subpath, env=conda_env_subpath
     )
@@ -160,58 +162,92 @@ class _OnnxModelWrapper:
         self.inputs = [(inp.name, inp.type) for inp in self.rt.get_inputs()]
         self.output_names = [outp.name for outp in self.rt.get_outputs()]
 
-    @staticmethod
-    def _cast_float64_to_float32(dataframe, column_names):
-        for input_name in column_names:
-            if dataframe[input_name].values.dtype == np.float64:
-                dataframe[input_name] = dataframe[input_name].values.astype(np.float32)
-        return dataframe
+    def _cast_float64_to_float32(self, feeds):
+        for input_name, input_type in self.inputs:
+            if input_type == "tensor(float)":
+                feed = feeds.get(input_name)
+                if feed is not None and feed.dtype == np.float64:
+                    feeds[input_name] = feed.astype(np.float32)
+        return feeds
 
     @experimental
-    def predict(self, dataframe):
+    def predict(self, data):
         """
-        :param dataframe: A Pandas DataFrame that is converted to a collection of ONNX Runtime
-                          inputs. If the underlying ONNX model only defines a *single* input
-                          tensor, the DataFrame's values are converted to a NumPy array
-                          representation using the `DataFrame.values()
-                          <https://pandas.pydata.org/pandas-docs/stable/reference/api/
-                          pandas.DataFrame.values.html#pandas.DataFrame.values>`_ method. If the
-                          underlying ONNX model defines *multiple* input tensors, each column
+        :param data: Either a pandas DataFrame, numpy.ndarray or a dictionary.
+
+                     Dictionary input is expected to be a valid ONNX model feed dictionary.
+
+                     Numpy array input is supported iff the model has a single tensor input and is
+                     converted into an ONNX feed dictionary with the appropriate key.
+
+                     Pandas DataFrame is converted to ONNX inputs as follows:
+                        - If the underlying ONNX model only defines a *single* input tensor, the
+                          DataFrame's values are converted to a NumPy array representation using the
+                         `DataFrame.values()
+                         <https://pandas.pydata.org/pandas-docs/stable/reference/api/
+                          pandas.DataFrame.values.html#pandas.DataFrame.values>`_ method.
+                        - If the underlying ONNX model defines *multiple* input tensors, each column
                           of the DataFrame is converted to a NumPy array representation.
-                          The corresponding NumPy array representation is then passed to the
-                          ONNX Runtime. For more information about the ONNX Runtime, see
-                          `<https://github.com/microsoft/onnxruntime>`_.
-        :return: A Pandas DataFrame output. Each column of the DataFrame corresponds to an
-                 output tensor produced by the underlying ONNX model.
+
+                      For more information about the ONNX Runtime, see
+                      `<https://github.com/microsoft/onnxruntime>`_.
+        :return: Model predictions. If the input is a pandas.DataFrame, the predictions are returned
+                 in a pandas.DataFrame. If the input is a numpy array or a dictionary the
+                 predictions are returned in a dictionary.
         """
+        if isinstance(data, dict):
+            feed_dict = data
+        elif isinstance(data, np.ndarray):
+            # NB: We do allow scoring with a single tensor (ndarray) in order to be compatible with
+            # supported pyfunc inputs iff the model has a single input. The passed tensor is
+            # assumed to be the first input.
+            if len(self.inputs) != 1:
+                inputs = [x[0] for x in self.inputs]
+                raise MlflowException(
+                    "Unable to map numpy array input to the expected model "
+                    "input. "
+                    "Numpy arrays can only be used as input for MLflow ONNX "
+                    "models that have a single input. This model requires "
+                    "{0} inputs. Please pass in data as either a "
+                    "dictionary or a DataFrame with the following tensors"
+                    ": {1}.".format(len(self.inputs), inputs)
+                )
+            feed_dict = {self.inputs[0][0]: data}
+        elif isinstance(data, pd.DataFrame):
+            if len(self.inputs) > 1:
+                feed_dict = {name: data[name].values for (name, _) in self.inputs}
+            else:
+                feed_dict = {self.inputs[0][0]: data.values}
+
+        else:
+            raise TypeError(
+                "Input should be a dictionary or a numpy array or a pandas.DataFrame, "
+                "got '{}'".format(type(data))
+            )
+
         # ONNXRuntime throws the following exception for some operators when the input
-        # dataframe contains float64 values. Unfortunately, even if the original user-supplied
-        # dataframe did not contain float64 values, the serialization/deserialization between the
+        # contains float64 values. Unfortunately, even if the original user-supplied input
+        # did not contain float64 values, the serialization/deserialization between the
         # client and the scoring server can introduce 64-bit floats. This is being tracked in
         # https://github.com/mlflow/mlflow/issues/1286. Meanwhile, we explicitly cast the input to
         # 32-bit floats when needed. TODO: Remove explicit casting when issue #1286 is fixed.
-        if len(self.inputs) > 1:
-            cols = [name for (name, type) in self.inputs if type == "tensor(float)"]
-        else:
-            cols = dataframe.columns if self.inputs[0][1] == "tensor(float)" else []
-
-        dataframe = _OnnxModelWrapper._cast_float64_to_float32(dataframe, cols)
-        if len(self.inputs) > 1:
-            feed_dict = {name: dataframe[name].values for (name, _) in self.inputs}
-        else:
-            feed_dict = {self.inputs[0][0]: dataframe.values}
+        feed_dict = self._cast_float64_to_float32(feed_dict)
         predicted = self.rt.run(self.output_names, feed_dict)
 
-        def format_output(data):
-            # Output can be list and it should be converted to a numpy array
-            # https://github.com/mlflow/mlflow/issues/2499
-            data = np.asarray(data)
-            return data.reshape(-1)
+        if isinstance(data, pd.DataFrame):
 
-        response = pd.DataFrame.from_dict(
-            {c: format_output(p) for (c, p) in zip(self.output_names, predicted)}
-        )
-        return response
+            def format_output(data):
+                # Output can be list and it should be converted to a numpy array
+                # https://github.com/mlflow/mlflow/issues/2499
+                data = np.asarray(data)
+                return data.reshape(-1)
+
+            response = pd.DataFrame.from_dict(
+                {c: format_output(p) for (c, p) in zip(self.output_names, predicted)}
+            )
+            return response
+        else:
+            return dict(zip(self.output_names, predicted))
 
 
 def _load_pyfunc(path):
@@ -299,9 +335,10 @@ def log_model(
                         signature = infer_signature(train, predictions)
     :param input_example: (Experimental) Input example provides one or several instances of valid
                           model input. The example can be used as a hint of what data to feed the
-                          model. The given example will be converted to a Pandas DataFrame and then
-                          serialized to json using the Pandas split-oriented format. Bytes are
-                          base64-encoded.
+                          model. The given example can be a Pandas DataFrame where the given
+                          example will be serialized to json using the Pandas split-oriented
+                          format, or a numpy array where the example will be serialized to json
+                          by converting it to a list. Bytes are base64-encoded.
     :param await_registration_for: Number of seconds to wait for the model version to finish
                             being created and is in ``READY`` status. By default, the function
                             waits for five minutes. Specify 0 or None to skip waiting.

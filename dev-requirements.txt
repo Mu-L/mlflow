@@ -1,13 +1,9 @@
 # Dev/Deployment
-sphinx==2.2.1
-sphinx_rtd_theme==0.4.3
-sphinx-autobuild==0.7.1
-sphinx-click==2.3.1
-gitpython>=2.1.0
-nose
-codecov
-coverage
-pypi-publisher
+# sphinx >= 4.0.0 is incompatible with our custom CSS styles and renders the documents improperly.
+# See https://github.com/mlflow/mlflow/pull/4480
+sphinx==3.5.4
+sphinx-autobuild
+sphinx-click
 scikit-learn
 scipy
 kubernetes

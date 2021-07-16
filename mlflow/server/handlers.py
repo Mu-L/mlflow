@@ -8,7 +8,6 @@ from functools import wraps
 
 from flask import Response, request, send_file
 from google.protobuf import descriptor
-from querystring_parser import parser
 
 from mlflow.entities import Metric, Param, RunTag, ViewType, ExperimentTag
 from mlflow.entities.model_registry import RegisteredModelTag, ModelVersionTag
@@ -155,6 +154,8 @@ def _get_request_json(flask_request=request):
 
 
 def _get_request_message(request_message, flask_request=request):
+    from querystring_parser import parser
+
     if flask_request.method == "GET" and len(flask_request.query_string) > 0:
         # This is a hack to make arrays of length 1 work with the parser.
         # for example experiment_ids%5B%5D=0 should be parsed to {experiment_ids: [0]}
@@ -239,6 +240,8 @@ _TEXT_EXTENSIONS = [
 
 @catch_mlflow_exception
 def get_artifact_handler():
+    from querystring_parser import parser
+
     query_string = request.query_string.decode("utf-8")
     request_dict = parser.parse(query_string, normalized=True)
     run_id = request_dict.get("run_id") or request_dict.get("run_uuid")
@@ -504,9 +507,15 @@ def _get_metric_history():
 @catch_mlflow_exception
 def _list_experiments():
     request_message = _get_request_message(ListExperiments())
-    experiment_entities = _get_tracking_store().list_experiments(request_message.view_type)
+    # `ListFields` returns a list of (FieldDescriptor, value) tuples for *present* fields:
+    # https://googleapis.dev/python/protobuf/latest/google/protobuf/message.html
+    # #google.protobuf.message.Message.ListFields
+    params = {field.name: val for field, val in request_message.ListFields()}
+    experiment_entities = _get_tracking_store().list_experiments(**params)
     response_message = ListExperiments.Response()
     response_message.experiments.extend([e.to_proto() for e in experiment_entities])
+    if experiment_entities.token:
+        response_message.next_page_token = experiment_entities.token
     response = Response(mimetype="application/json")
     response.set_data(message_to_json(response_message))
     return response
@@ -695,6 +704,8 @@ def _create_model_version():
 
 @catch_mlflow_exception
 def get_model_version_artifact_handler():
+    from querystring_parser import parser
+
     query_string = request.query_string.decode("utf-8")
     request_dict = parser.parse(query_string, normalized=True)
     name = request_dict.get("name")

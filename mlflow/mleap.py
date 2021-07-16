@@ -12,7 +12,6 @@ import logging
 import os
 import sys
 import traceback
-from six import reraise
 
 import mlflow
 from mlflow.models import Model
@@ -20,6 +19,7 @@ from mlflow.models.model import MLMODEL_FILE_NAME
 from mlflow.exceptions import MlflowException
 from mlflow.models.signature import ModelSignature
 from mlflow.models.utils import ModelInputExample, _save_example
+from mlflow.utils import reraise
 from mlflow.utils.annotations import keyword_only
 
 FLAVOR_NAME = "mleap"
@@ -125,7 +125,7 @@ def save_model(
     spark_model,
     sample_input,
     path,
-    mlflow_model=Model(),
+    mlflow_model=None,
     signature: ModelSignature = None,
     input_example: ModelInputExample = None,
 ):
@@ -185,6 +185,9 @@ def save_model(
 
 
     """
+    if mlflow_model is None:
+        mlflow_model = Model()
+
     add_to_model(
         mlflow_model=mlflow_model, path=path, spark_model=spark_model, sample_input=sample_input
     )

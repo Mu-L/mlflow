@@ -1,6 +1,7 @@
 import os
 import random
 from collections import namedtuple
+from packaging.version import Version
 
 import pandas as pd
 import pytest
@@ -20,18 +21,32 @@ from mlflow.utils.environment import _mlflow_conda_env
 from mlflow.utils.file_utils import TempDir
 from mlflow.utils.model_utils import _get_flavor_configuration
 from tests.conftest import tracking_uri_mock  # pylint: disable=unused-import, E0611
+from tests.helper_functions import _compare_conda_env_requirements
 
 ModelWithData = namedtuple("ModelWithData", ["model", "inference_data"])
+
+
+IS_SPACY_VERSION_NEWER_THAN_OR_EQUAL_TO_3_0_0 = Version(spacy.__version__) >= Version("3.0.0")
 
 
 @pytest.fixture(scope="module")
 def spacy_model_with_data():
     # Creating blank model and setting up the spaCy pipeline
     nlp = spacy.blank("en")
-    textcat = nlp.create_pipe(
-        "textcat", config={"exclusive_classes": True, "architecture": "simple_cnn"}
-    )
-    nlp.add_pipe(textcat, last=True)
+    if IS_SPACY_VERSION_NEWER_THAN_OR_EQUAL_TO_3_0_0:
+        from spacy.pipeline.tok2vec import DEFAULT_TOK2VEC_MODEL
+
+        model = {
+            "@architectures": "spacy.TextCatCNN.v1",
+            "exclusive_classes": True,
+            "tok2vec": DEFAULT_TOK2VEC_MODEL,
+        }
+        textcat = nlp.add_pipe("textcat", config={"model": model}, last=True)
+    else:
+        textcat = nlp.create_pipe(
+            "textcat", config={"exclusive_classes": True, "architecture": "simple_cnn"}
+        )
+        nlp.add_pipe(textcat, last=True)
 
     # Training the model to recognize between computer graphics and baseball in 20newsgroups dataset
     categories = ["comp.graphics", "rec.sport.baseball"]
@@ -41,6 +56,12 @@ def spacy_model_with_data():
     # Split train/test and train the model
     train_x, train_y, test_x, _ = _get_train_test_dataset(categories)
     train_data = list(zip(train_x, [{"cats": cats} for cats in train_y]))
+
+    if IS_SPACY_VERSION_NEWER_THAN_OR_EQUAL_TO_3_0_0:
+        from spacy.training import Example
+
+        train_data = [Example.from_dict(nlp.make_doc(text), cats) for text, cats in train_data]
+
     _train_model(nlp, train_data)
     return ModelWithData(nlp, pd.DataFrame(test_x))
 
@@ -48,7 +69,7 @@ def spacy_model_with_data():
 @pytest.fixture
 def spacy_custom_env(tmpdir):
     conda_env = os.path.join(str(tmpdir), "conda_env.yml")
-    _mlflow_conda_env(conda_env, additional_conda_deps=["pytest"], additional_pip_deps=["spacy"])
+    _mlflow_conda_env(conda_env, additional_pip_deps=["pytest", "spacy"])
     return conda_env
 
 
@@ -62,6 +83,10 @@ def test_model_save_load(spacy_model_with_data, model_path):
     spacy_model = spacy_model_with_data.model
     mlflow.spacy.save_model(spacy_model=spacy_model, path=model_path)
     loaded_model = mlflow.spacy.load_model(model_path)
+
+    # Remove a `_sourced_vectors_hashes` field which is added when spaCy loads a model:
+    # https://github.com/explosion/spaCy/blob/e8ef4a46d5dbc9bb6d629ecd0b02721d6bdf2f87/spacy/language.py#L1701
+    loaded_model.meta.pop("_sourced_vectors_hashes", None)
 
     # Comparing the meta dictionaries for the original and loaded models
     assert spacy_model.meta == loaded_model.meta
@@ -138,6 +163,18 @@ def test_model_log(spacy_model_with_data, tracking_uri_mock):  # pylint: disable
 
 
 @pytest.mark.large
+def test_model_save_persists_requirements_in_mlflow_model_directory(
+    spacy_model_with_data, model_path, spacy_custom_env
+):
+    mlflow.spacy.save_model(
+        spacy_model=spacy_model_with_data.model, path=model_path, conda_env=spacy_custom_env
+    )
+
+    saved_pip_req_path = os.path.join(model_path, "requirements.txt")
+    _compare_conda_env_requirements(spacy_custom_env, saved_pip_req_path)
+
+
+@pytest.mark.large
 def test_model_save_persists_specified_conda_env_in_mlflow_model_directory(
     spacy_model_with_data, model_path, spacy_custom_env
 ):
@@ -204,6 +241,27 @@ def test_model_log_persists_specified_conda_env_in_mlflow_model_directory(
 
 
 @pytest.mark.large
+def test_model_log_persists_requirements_in_mlflow_model_directory(
+    spacy_model_with_data, spacy_custom_env
+):
+    artifact_path = "model"
+    with mlflow.start_run():
+        mlflow.spacy.log_model(
+            spacy_model=spacy_model_with_data.model,
+            artifact_path=artifact_path,
+            conda_env=spacy_custom_env,
+        )
+        model_path = _download_artifact_from_uri(
+            "runs:/{run_id}/{artifact_path}".format(
+                run_id=mlflow.active_run().info.run_id, artifact_path=artifact_path
+            )
+        )
+
+    saved_pip_req_path = os.path.join(model_path, "requirements.txt")
+    _compare_conda_env_requirements(spacy_custom_env, saved_pip_req_path)
+
+
+@pytest.mark.large
 def test_model_save_without_specified_conda_env_uses_default_env_with_expected_dependencies(
     spacy_model_with_data, model_path
 ):
@@ -261,8 +319,11 @@ def test_model_log_without_pyfunc_flavor():
     nlp = spacy.blank("en")
 
     # Add a component not compatible with pyfunc
-    ner = nlp.create_pipe("ner")
-    nlp.add_pipe(ner, last=True)
+    if IS_SPACY_VERSION_NEWER_THAN_OR_EQUAL_TO_3_0_0:
+        nlp.add_pipe("ner", last=True)
+    else:
+        ner = nlp.create_pipe("ner")
+        nlp.add_pipe(ner, last=True)
 
     # Ensure the pyfunc flavor is not present after logging and loading the model
     with mlflow.start_run():
@@ -285,8 +346,11 @@ def _train_model(nlp, train_data, n_iter=5):
         random.shuffle(train_data)
         batches = minibatch(train_data, size=batch_sizes)
         for batch in batches:
-            texts, annotations = zip(*batch)
-            nlp.update(texts, annotations, sgd=optimizer, drop=0.2, losses=losses)
+            if IS_SPACY_VERSION_NEWER_THAN_OR_EQUAL_TO_3_0_0:
+                nlp.update(batch, sgd=optimizer, drop=0.2, losses=losses)
+            else:
+                texts, annotations = zip(*batch)
+                nlp.update(texts, annotations, sgd=optimizer, drop=0.2, losses=losses)
 
 
 def _get_train_test_dataset(cats_to_fetch, limit=100):

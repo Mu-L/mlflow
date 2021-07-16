@@ -42,9 +42,14 @@ class S3ArtifactRepository(ArtifactRepository):
         s3_endpoint_url = os.environ.get("MLFLOW_S3_ENDPOINT_URL")
         ignore_tls = os.environ.get("MLFLOW_S3_IGNORE_TLS")
 
-        verify = True
+        do_verify = True
         if ignore_tls:
-            verify = ignore_tls.lower() not in ["true", "yes", "1"]
+            do_verify = ignore_tls.lower() not in ["true", "yes", "1"]
+
+        # The valid verify argument value is None/False/path to cert bundle file, See
+        # https://github.com/boto/boto3/blob/73865126cad3938ca80a2f567a1c79cb248169a7/
+        # boto3/session.py#L212
+        verify = None if do_verify else False
 
         # NOTE: If you need to specify this env variable, please file an issue at
         # https://github.com/mlflow/mlflow/issues so we know your use-case!
@@ -147,4 +152,15 @@ class S3ArtifactRepository(ArtifactRepository):
         s3_client.download_file(bucket, s3_full_path, local_path)
 
     def delete_artifacts(self, artifact_path=None):
-        raise MlflowException("Not implemented yet")
+        (bucket, dest_path) = data.parse_s3_uri(self.artifact_uri)
+        if artifact_path:
+            dest_path = posixpath.join(dest_path, artifact_path)
+
+        s3_client = self._get_s3_client()
+        list_objects = s3_client.list_objects(Bucket=bucket, Prefix=dest_path).get("Contents", [])
+        for to_delete_obj in list_objects:
+            file_path = to_delete_obj.get("Key")
+            self._verify_listed_object_contains_artifact_path_prefix(
+                listed_object_path=file_path, artifact_path=dest_path
+            )
+            s3_client.delete_object(Bucket=bucket, Key=file_path)

@@ -1,5 +1,8 @@
 import React from 'react';
+import _ from 'lodash';
 import { Modal, Button } from 'antd';
+import { FormattedMessage, injectIntl } from 'react-intl';
+
 import {
   RegisterModelForm,
   CREATE_NEW_MODEL_OPTION_VALUE,
@@ -11,13 +14,17 @@ import {
   createModelVersionApi,
   listRegisteredModelsApi,
   searchModelVersionsApi,
+  searchRegisteredModelsApi,
 } from '../actions';
 import PropTypes from 'prop-types';
 import { connect } from 'react-redux';
 import Utils from '../../common/utils/Utils';
 import { getUUID } from '../../common/utils/ActionUtils';
+import { getModelNameFilter } from '../../model-registry/utils/SearchUtils';
 
-class RegisterModelButton extends React.Component {
+const MAX_SEARCH_REGISTERED_MODELS = 5; // used in drop-down list so not many are visible at once
+
+export class RegisterModelButtonImpl extends React.Component {
   static propTypes = {
     // own props
     disabled: PropTypes.bool.isRequired,
@@ -29,11 +36,14 @@ class RegisterModelButton extends React.Component {
     createModelVersionApi: PropTypes.func.isRequired,
     listRegisteredModelsApi: PropTypes.func.isRequired,
     searchModelVersionsApi: PropTypes.func.isRequired,
+    searchRegisteredModelsApi: PropTypes.func.isRequired,
+    intl: PropTypes.shape({ formatMessage: PropTypes.func.isRequired }).isRequired,
   };
 
   state = {
     visible: false,
     confirmLoading: false,
+    modelByName: {},
   };
 
   createRegisteredModelRequestId = getUUID();
@@ -59,6 +69,10 @@ class RegisterModelButton extends React.Component {
   handleRegistrationFailure = (e) => {
     this.setState({ confirmLoading: false });
     Utils.logErrorAndNotifyUser(e);
+  };
+
+  handleSearchRegisteredModels = (input) => {
+    this.props.searchRegisteredModelsApi(getModelNameFilter(input), MAX_SEARCH_REGISTERED_MODELS);
   };
 
   reloadModelVersionsForCurrentRun = () => {
@@ -138,22 +152,51 @@ class RegisterModelButton extends React.Component {
           disabled={disabled}
           htmlType='button'
         >
-          Register Model
+          <FormattedMessage
+            defaultMessage='Register Model'
+            description='Button text to register the model for deployment'
+          />
         </Button>
         <Modal
-          title='Register Model'
+          title={this.props.intl.formatMessage({
+            defaultMessage: 'Register Model',
+            description: 'Register model modal title to register the model for deployment',
+          })}
           width={540}
           visible={visible}
           onOk={this.handleRegisterModel}
-          okText='Register'
+          okText={this.props.intl.formatMessage({
+            defaultMessage: 'Register',
+            description: 'Confirmation text to register the model',
+          })}
           confirmLoading={confirmLoading}
           onCancel={this.hideRegisterModal}
           centered
+          footer={[
+            <Button key='back' onClick={this.hideRegisterModal}>
+              <FormattedMessage
+                defaultMessage='Cancel'
+                description='Cancel button text to cancel the flow to register the model'
+              />
+            </Button>,
+            <Button
+              key='submit'
+              type='primary'
+              onClick={this.handleRegisterModel}
+              data-test-id='confirm-register-model'
+            >
+              <FormattedMessage
+                defaultMessage='Register'
+                description='Register button text to register the model'
+              />
+            </Button>,
+          ]}
         >
           <RegisterModelForm
             modelByName={modelByName}
             ref={this.saveFormRef}
             wrappedComponentRef={this.saveFormComponentRef}
+            onSearchRegisteredModels={_.debounce(this.handleSearchRegisteredModels, 300)}
           />
         </Modal>
       </div>
@@ -170,6 +213,11 @@ const mapDispatchToProps = {
   createModelVersionApi,
   listRegisteredModelsApi,
   searchModelVersionsApi,
+  searchRegisteredModelsApi,
 };
 
-export default connect(mapStateToProps, mapDispatchToProps)(RegisterModelButton);
+export const RegisterModelButtonWithIntl = injectIntl(RegisterModelButtonImpl);
+export const RegisterModelButton = connect(
+  mapStateToProps,
+  mapDispatchToProps,
+)(RegisterModelButtonWithIntl);
